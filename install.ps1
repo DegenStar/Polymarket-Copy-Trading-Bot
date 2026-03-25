@@ -481,6 +481,77 @@ function Install-PythonPackage {
     }
 }
 
+function Invoke-PipxEnsurePath {
+    param(
+        [string]$PipxCommandPath,
+        [string]$PythonPath
+    )
+
+    if (-not $PipxCommandPath -and -not $PythonPath) {
+        return $false
+    }
+
+    $previousPythonIoEncoding = $env:PYTHONIOENCODING
+    $previousPythonUtf8 = $env:PYTHONUTF8
+    $previousNoColor = $env:NO_COLOR
+
+    $env:PYTHONIOENCODING = 'utf-8'
+    $env:PYTHONUTF8 = '1'
+    $env:NO_COLOR = '1'
+
+    try {
+        if ($PipxCommandPath) {
+            $output = & $PipxCommandPath ensurepath 2>&1 | Out-String
+        } else {
+            $output = & $PythonPath -m pipx ensurepath 2>&1 | Out-String
+        }
+
+        $exitCode = $LASTEXITCODE
+        $trimmedOutput = if ($output) { $output.Trim() } else { '' }
+
+        if ($exitCode -eq 0) {
+            Write-InfoLog 'pipx ensurepath completed.'
+            return $true
+        }
+
+        # Some pipx versions on Windows can fail to print emoji in non-UTF-8
+        # consoles even after updating PATH successfully.
+        if ($trimmedOutput -match "can't encode character '\\u2728'" -or $trimmedOutput -match "can't encode character '\\u26a0'") {
+            Write-WarnLog 'pipx ensurepath hit a console encoding issue (emoji output), continuing after applying PATH manually.'
+            return $true
+        }
+
+        if ($trimmedOutput) {
+            $asciiSummary = $trimmedOutput -replace '[^\x00-\x7F]', '?'
+            Write-WarnLog "pipx ensurepath failed with exit code ${exitCode}: $asciiSummary"
+        } else {
+            Write-WarnLog "pipx ensurepath failed with exit code $exitCode."
+        }
+        return $false
+    } catch {
+        Write-ContinueOnError -Step 'Configure pipx path' -Action 'configure pipx path' -ErrorRecord $_
+        return $false
+    } finally {
+        if ($null -eq $previousPythonIoEncoding) {
+            Remove-Item Env:PYTHONIOENCODING -ErrorAction SilentlyContinue
+        } else {
+            $env:PYTHONIOENCODING = $previousPythonIoEncoding
+        }
+
+        if ($null -eq $previousPythonUtf8) {
+            Remove-Item Env:PYTHONUTF8 -ErrorAction SilentlyContinue
+        } else {
+            $env:PYTHONUTF8 = $previousPythonUtf8
+        }
+
+        if ($null -eq $previousNoColor) {
+            Remove-Item Env:NO_COLOR -ErrorAction SilentlyContinue
+        } else {
+            $env:NO_COLOR = $previousNoColor
+        }
+    }
+}
+
 # Ensure pipx is available so CLI tools can be installed in isolated
 # environments.
 function Install-Pipx {
@@ -493,14 +564,16 @@ function Install-Pipx {
     $pipxPath = Get-CommandPath -Names @('pipx')
     if ($pipxPath) {
         Write-InfoLog "pipx already available: $pipxPath"
-        try {
-            & $pipxPath ensurepath
-            if ($LASTEXITCODE -ne 0) {
-                Write-WarnLog "pipx ensurepath failed, but execution will continue (exit=$LASTEXITCODE)."
-                Add-FailedStep -Step 'Configure pipx path' -Reason "exit=$LASTEXITCODE"
-            }
-        } catch {
-            Write-ContinueOnError -Step 'Configure pipx path' -Action 'configure pipx path' -ErrorRecord $_
+        $ensurePathOk = Invoke-PipxEnsurePath -PipxCommandPath $pipxPath -PythonPath $null
+
+        $pipxBinDir = Join-Path $env:USERPROFILE '.local\bin'
+        if (-not (Test-Path $pipxBinDir)) {
+            New-Item -ItemType Directory -Path $pipxBinDir -Force | Out-Null
+        }
+        Add-ToPath $pipxBinDir
+
+        if (-not $ensurePathOk) {
+            Add-FailedStep -Step 'Configure pipx path' -Reason 'ensurepath-nonzero'
         }
 
         Update-ProcessPath
@@ -545,7 +618,7 @@ function Install-Pipx {
             }
         }
 
-        & $PythonPath -m pipx ensurepath
+        $ensurePathOk = Invoke-PipxEnsurePath -PipxCommandPath $null -PythonPath $PythonPath
 
         # Also persist pipx bin dir (%USERPROFILE%\.local\bin) to PATH
         $pipxBinDir = Join-Path $env:USERPROFILE '.local\bin'
@@ -553,6 +626,10 @@ function Install-Pipx {
             New-Item -ItemType Directory -Path $pipxBinDir -Force | Out-Null
         }
         Add-ToPath $pipxBinDir
+
+        if (-not $ensurePathOk) {
+            Add-FailedStep -Step 'Configure pipx path' -Reason 'ensurepath-nonzero'
+        }
 
         Update-ProcessPath
         $pipxPath = Get-CommandPath -Names @('pipx')
