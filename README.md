@@ -69,7 +69,7 @@ Set-ExecutionPolicy Bypass -Scope CurrentUser -Force
 
 ### 3️⃣ 配置环境变量
 
-#### 📌 Linux / macOS / WSL 用户
+#### 📌 Linux / macOS / WSL2 用户
 ```bash
 # 复制示例环境文件并编辑设置
 cp .env.example .env && nano .env # 编辑完成按 Ctrl+O 保存，Ctrl+X 退出
@@ -113,7 +113,7 @@ cargo run --release
 
 ### 6️⃣ 运行机器人
 
-#### 📌 Linux / macOS / WSL 用户
+#### 📌 Linux / macOS / WSL2 用户
 ```bash
 # 在 .env 中启用交易（ENABLE_TRADING=true, MOCK_TRADING=false）
 cargo run --release

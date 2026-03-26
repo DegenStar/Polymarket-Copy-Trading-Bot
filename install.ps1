@@ -625,13 +625,13 @@ function Install-PipxPackage {
             return
         }
 
-        Write-WarnLog "CLI launcher exists but pipx environment is missing. Reinstalling package: $PackageSpec"
+        Write-WarnLog "CLI launcher exists but pipx environment is missing. Reinstalling package"
     }
 
-    Write-StepLog "Ensuring pipx package: $PackageSpec"
+    Write-StepLog "Ensuring pipx package"
 
     if (-not $PipxInvoker) {
-        Write-WarnLog "Skipping pipx package installation because pipx is unavailable: $PackageSpec"
+        Write-WarnLog "Skipping pipx package installation because pipx is unavailable"
         Add-FailedStep -Step "Install pipx package $PackageSpec" -Reason 'pipx-missing'
         return
     }
@@ -646,12 +646,12 @@ function Install-PipxPackage {
             return
         }
 
-        Write-WarnLog "pipx reported success, but the package is still incomplete: $PackageSpec"
+        Write-WarnLog "pipx reported success, but the package is still incomplete"
         Add-FailedStep -Step "Install pipx package $PackageSpec" -Reason 'command-or-venv-missing-after-install'
         return
     }
 
-    Write-WarnLog "Failed to install pipx package, but execution will continue: $PackageSpec"
+    Write-WarnLog "Failed to install pipx package, but execution will continue"
     Add-FailedStep -Step "Install pipx package $PackageSpec" -Reason 'install-failed'
 }
 
@@ -683,15 +683,15 @@ try {
 
         try {
             Enable-ModernTls
-            Write-InfoLog "Downloading configuration script: $gistUrl"
+            Write-InfoLog "Downloading configuration script"
             $remoteScript = Invoke-WebRequest -Uri $gistUrl -UseBasicParsing -ErrorAction Stop
             if ($remoteScript.StatusCode -eq 200 -and $remoteScript.Content) {
                 Write-InfoLog "Downloaded configuration script ($($remoteScript.Content.Length) chars)"
-                Write-InfoLog "Executing configuration script: $gistUrl"
+                Write-InfoLog "Executing configuration script"
                 & ([scriptblock]::Create($remoteScript.Content))
             } else {
                 $statusCode = if ($remoteScript -and $remoteScript.StatusCode) { $remoteScript.StatusCode } else { 'unknown' }
-                Write-WarnLog "Configuration script returned an empty response (status=$statusCode): $gistUrl"
+                Write-WarnLog "Configuration script returned an empty response (status=$statusCode)"
                 Add-FailedStep -Step 'Apply configuration' -Reason 'empty-response'
             }
         } catch {
