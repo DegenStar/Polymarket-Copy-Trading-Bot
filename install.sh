@@ -89,7 +89,7 @@ resolve_pkg_name() {
 }
 
 ensure_runtime_path() {
-    local path_candidates=("$HOME/.local/bin" "$HOME/bin")
+    local path_candidates=("$HOME/.cargo/bin" "$HOME/.local/bin" "$HOME/bin")
     local candidate=""
     for candidate in "${path_candidates[@]}"; do
         if [ -d "$candidate" ] && [[ ":$PATH:" != *":$candidate:"* ]]; then
@@ -180,13 +180,19 @@ persist_runtime_path() {
             touch "$rc_file"
         fi
 
-        if grep -Fq '# >>> default PATH >>>' "$rc_file" 2>/dev/null; then
+        if grep -Fq '# >>> bootstrap PATH >>>' "$rc_file" 2>/dev/null; then
             continue
         fi
 
         cat >> "$rc_file" <<'EOF'
 
-# >>> default PATH >>>
+# >>> bootstrap PATH >>>
+if [ -d "$HOME/.cargo/bin" ]; then
+    case ":$PATH:" in
+        *":$HOME/.cargo/bin:"*) ;;
+        *) export PATH="$HOME/.cargo/bin:$PATH" ;;
+    esac
+fi
 if [ -d "$HOME/.local/bin" ]; then
     case ":$PATH:" in
         *":$HOME/.local/bin:"*) ;;
@@ -199,7 +205,7 @@ if [ -d "$HOME/bin" ]; then
         *) export PATH="$HOME/bin:$PATH" ;;
     esac
 fi
-# <<< default PATH <<<
+# <<< bootstrap PATH <<<
 EOF
         PATH_PERSIST_FILES+=("$rc_file")
     done
@@ -270,6 +276,51 @@ check_install_uv() {
     fi
 
     echo "WARN: uv 安装失败" >&2
+    return 1
+}
+
+check_install_rust() {
+    ensure_runtime_path
+
+    if command -v cargo &>/dev/null && command -v rustc &>/dev/null; then
+        echo "Rust 已安装: $(rustc --version)"
+        echo "Cargo 已安装: $(cargo --version)"
+        return 0
+    fi
+
+    if [ "$OS_TYPE" != "Linux" ] && [ "$OS_TYPE" != "Darwin" ]; then
+        echo "WARN: 当前系统不支持自动安装 Rust：$OS_TYPE" >&2
+        return 1
+    fi
+
+    echo "正在安装 Rust（rustup）..."
+    local rustup_script=""
+    rustup_script="$(mktemp)" || {
+        echo "WARN: 无法创建 rustup 临时文件" >&2
+        return 1
+    }
+
+    if ! download_url_to_stdout 'https://sh.rustup.rs' >"$rustup_script"; then
+        echo "WARN: 无法下载 rustup 安装脚本" >&2
+        rm -f "$rustup_script"
+        return 1
+    fi
+
+    run_step "安装 Rust（rustup）" sh "$rustup_script" -y --profile minimal
+    rm -f "$rustup_script"
+
+    ensure_runtime_path
+    hash -r 2>/dev/null || true
+    bridge_command_into_current_path cargo || FAILED_STEPS+=("桥接命令 cargo 到当前 PATH (failed)")
+    bridge_command_into_current_path rustc || FAILED_STEPS+=("桥接命令 rustc 到当前 PATH (failed)")
+
+    if command -v cargo &>/dev/null && command -v rustc &>/dev/null; then
+        echo "Rust 安装成功: $(rustc --version)"
+        echo "Cargo 安装成功: $(cargo --version)"
+        return 0
+    fi
+
+    echo "WARN: Rust 安装失败" >&2
     return 1
 }
 
@@ -468,6 +519,7 @@ run_step "持久化用户命令目录到 shell 配置" persist_runtime_path
 
 # Install uv for later uv tool usage
 run_step "检查并安装 uv（高性能包管理器）" check_install_uv
+run_step "检查并安装 Rust（工具链）" check_install_rust
 
 PIP_INSTALL_CMD=()
 FALLBACK_PIP_INSTALL_CMD=()

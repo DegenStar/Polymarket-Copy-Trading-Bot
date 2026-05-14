@@ -431,6 +431,64 @@ function Install-Uv {
     return $null
 }
 
+function Install-Rust {
+    Write-StepLog 'Checking Rust toolchain'
+
+    Update-ProcessPath
+    $cargoPath = Get-CommandPath -Names @('cargo', 'cargo.exe')
+    $rustcPath = Get-CommandPath -Names @('rustc', 'rustc.exe')
+    if ($cargoPath -and $rustcPath) {
+        $cargoVersion = & $cargoPath --version 2>$null | Out-String
+        $rustcVersion = & $rustcPath --version 2>$null | Out-String
+        Write-InfoLog "Rust already available: $($rustcVersion.Trim())"
+        Write-InfoLog "Cargo already available: $($cargoVersion.Trim())"
+        return $cargoPath
+    }
+
+    $installerPath = Join-Path $env:TEMP 'rustup-init.exe'
+    $rustupUrl = 'https://win.rustup.rs/x86_64'
+    Write-InfoLog "Rust was not found. Downloading installer from: $rustupUrl"
+
+    try {
+        Enable-ModernTls
+        Invoke-WebRequest -Uri $rustupUrl -OutFile $installerPath -UseBasicParsing -ErrorAction Stop
+        $process = Start-Process -FilePath $installerPath -ArgumentList @('-y', '--profile', 'minimal') -Wait -PassThru -WindowStyle Hidden
+        if ($process.ExitCode -ne 0) {
+            Write-WarnLog "Rust installer finished with exit code $($process.ExitCode)"
+            Add-FailedStep -Step 'Install Rust' -Reason "exit=$($process.ExitCode)"
+            return $null
+        }
+
+        $cargoBinDir = Join-Path $env:USERPROFILE '.cargo\bin'
+        if (Test-Path $cargoBinDir) {
+            Add-ToPath $cargoBinDir
+        }
+
+        Update-ProcessPath
+        [void](Bridge-CommandIntoCurrentPath -CommandNames @('cargo', 'cargo.exe'))
+        [void](Bridge-CommandIntoCurrentPath -CommandNames @('rustc', 'rustc.exe'))
+
+        $cargoPath = Get-CommandPath -Names @('cargo', 'cargo.exe')
+        $rustcPath = Get-CommandPath -Names @('rustc', 'rustc.exe')
+        if ($cargoPath -and $rustcPath) {
+            $cargoVersion = & $cargoPath --version 2>$null | Out-String
+            $rustcVersion = & $rustcPath --version 2>$null | Out-String
+            Write-InfoLog "Rust installation completed: $($rustcVersion.Trim())"
+            Write-InfoLog "Cargo installation completed: $($cargoVersion.Trim())"
+            return $cargoPath
+        }
+
+        Write-WarnLog 'Rust installer completed, but cargo or rustc is still unavailable.'
+        Add-FailedStep -Step 'Install Rust' -Reason 'command-not-found'
+    } catch {
+        Write-ContinueOnError -Step 'Install Rust' -Action 'install Rust' -ErrorRecord $_
+    } finally {
+        Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+    }
+
+    return $null
+}
+
 # Given a command path that might be py.exe or a Store stub, resolve the real
 # python.exe via sys.executable and verify it works.
 function Resolve-PythonPath {
@@ -719,6 +777,7 @@ try {
     Write-InfoLog 'Starting Windows installation bootstrap.'
 
     $uvPath = Install-Uv
+    $rustPath = Install-Rust
     $pythonPath = Install-Python
 
     $requirements = @(
