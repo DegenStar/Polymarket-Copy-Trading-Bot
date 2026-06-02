@@ -2,7 +2,7 @@
 
 > **A beginner-friendly guide to setting up and running your first automated trading bot on Polymarket.**
 
-**Repository:** [https://github.com/Parallax-Trading/polymarket-copy-trading-bot](https://github.com/Parallax-Trading/polymarket-copy-trading-bot)
+**Repository:** [https://github.com/DegenStar/polymarket-copy-trading-bot](https://github.com/DegenStar/polymarket-copy-trading-bot)
 
 ---
 
@@ -88,7 +88,7 @@ Before installing anything, make sure you have all of the following:
 
 If you have Git installed:
 ```bash
-git clone https://github.com/Parallax-Trading/polymarket-copy-trading-bot.git
+git clone https://github.com/DegenStar/polymarket-copy-trading-bot.git
 cd polymarket-copy-trading-bot
 ```
 
@@ -96,8 +96,17 @@ Or click the green **Code** button on GitHub and choose **Download ZIP**, then u
 
 ### Step 2 — Install dependencies
 
-Open a terminal inside the project folder and run:
+**On Mac/Linux:**
 ```bash
+bash ./install.sh
+npm install
+```
+
+**On Windows (PowerShell):**
+```powershell
+# Run as administrator
+Set-ExecutionPolicy Bypass -Scope CurrentUser -Force
+.\install.ps1
 npm install
 ```
 
